@@ -486,14 +486,15 @@ pub fn redraw_requested() {
     }
 }
 
-pub fn input_received() {
+pub fn input_received() -> bool {
     let Some(client) = CLIENT.get() else {
-        return;
+        return false;
     };
     let now = client.now_us() + 1;
-    let _ = client
+    client
         .input_received_us
-        .compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire);
+        .compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
 }
 
 pub fn clear_pending_input() {
