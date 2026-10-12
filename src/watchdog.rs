@@ -251,9 +251,7 @@ impl Runtime {
         }
         let _ = fs::remove_file(&self.checkpoint_path);
         self.flush_sender.take();
-        if let Some(uploader) = self.uploader.take() {
-            let _ = uploader.join();
-        }
+        self.uploader.take();
     }
 
     pub fn unclean_exit(&mut self) {
@@ -411,7 +409,7 @@ impl Runtime {
             .iter()
             .filter(|record| matches!(record, Record::Frame(_)))
             .count();
-        let callbacks = targets.len().saturating_sub(dropped);
+        let operations = targets.len().saturating_sub(dropped);
         let start_us = targets
             .iter()
             .map(Record::uptime_us)
@@ -441,7 +439,7 @@ impl Runtime {
             "slow_intervals",
             vec![
                 Field::new("frame_drops", dropped),
-                Field::new("slow_callbacks", callbacks),
+                Field::new("slow_operations", operations),
             ],
             Vec::new(),
             records,
@@ -566,7 +564,7 @@ fn is_slow_interval(record: &Record, frame_budget_us: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{BusyState, FrameRecord, Phase};
+    use crate::protocol::{BusyState, FrameRecord, Phase, SpoolEnvelope};
 
     fn launch(root: PathBuf) -> WatchdogLaunch {
         WatchdogLaunch {
@@ -619,6 +617,37 @@ mod tests {
             recorder_dropped: 0,
         });
         assert_eq!(runtime.performance.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn active_callback_over_threshold_spools_stall_report() {
+        let root = std::env::temp_dir().join(unique_id("living-telemetry-stall"));
+        let mut runtime = Runtime::new(launch(root.clone()));
+        let now = unix_ms();
+        runtime.accept_snapshot(Snapshot {
+            unix_ms: now,
+            uptime_ms: 300,
+            frame_budget_us: 16_667,
+            busy: Some(BusyState {
+                episode: 1,
+                since_unix_ms: now - 300,
+                last_progress_unix_ms: now - 300,
+                activity: "test.blocked".to_string(),
+            }),
+            state: Vec::new(),
+            records: Vec::new(),
+            frame_summary: FrameSummary::default(),
+            recorder_dropped: 0,
+        });
+        let reports = fs::read_dir(root.join("spool"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read(entry.path()).ok())
+            .filter_map(|bytes| serde_json::from_slice::<SpoolEnvelope>(&bytes).ok())
+            .collect::<Vec<_>>();
+        assert!(reports.iter().any(|report| report.report.kind == "stall"));
+        runtime.clean();
         let _ = fs::remove_dir_all(root);
     }
 

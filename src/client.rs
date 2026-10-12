@@ -608,37 +608,14 @@ impl Frame {
         };
         let total_us = duration_us(self.start.elapsed());
         let budget_us = client.frame_budget_us.load(Ordering::Acquire).max(1);
-        let latency_limit = budget_us.saturating_mul(3) / 2;
-        let cadence_limit = budget_us.saturating_add((budget_us / 10).max(2_000));
-        let mut missed = Vec::new();
-        if total_us > budget_us {
-            missed.push("cpu".to_string());
-        }
-        if self
-            .request_wait_us
-            .is_some_and(|duration| duration > latency_limit)
-        {
-            missed.push("redraw_latency".to_string());
-        }
-        if self
-            .input_wait_us
-            .is_some_and(|duration| duration > latency_limit)
-        {
-            missed.push("input_latency".to_string());
-        }
-        if self
-            .active_interval_us
-            .is_some_and(|duration| duration > cadence_limit)
-        {
-            missed.push("cadence".to_string());
-        }
-        if self
-            .phases
-            .iter()
-            .any(|phase| phase.duration_us > budget_us)
-        {
-            missed.push("phase".to_string());
-        }
+        let missed = classify_frame(
+            total_us,
+            self.request_wait_us,
+            self.input_wait_us,
+            self.active_interval_us,
+            &self.phases,
+            budget_us,
+        );
         let dropped = !missed.is_empty();
         if let Ok(mut shared) = client.shared.try_lock() {
             shared.frame_summary.record(
@@ -877,7 +854,7 @@ fn reporter_loop(client: Arc<Client>, launch: WatchdogLaunch) {
     }
     drop(writer);
     if let Some((mut child, _)) = child.take() {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_millis(500);
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => break,
@@ -911,12 +888,44 @@ fn load_or_create_device(root: &Path) -> Result<String, String> {
     Ok(value)
 }
 
+fn classify_frame(
+    total_us: u64,
+    request_wait_us: Option<u64>,
+    input_wait_us: Option<u64>,
+    active_interval_us: Option<u64>,
+    phases: &[Phase],
+    budget_us: u64,
+) -> Vec<String> {
+    let latency_limit = budget_us.saturating_mul(3) / 2;
+    let cadence_limit = budget_us.saturating_add((budget_us / 10).max(2_000));
+    let mut missed = Vec::new();
+    if total_us > budget_us {
+        missed.push("cpu".to_string());
+    }
+    if request_wait_us.is_some_and(|duration| duration > latency_limit) {
+        missed.push("redraw_latency".to_string());
+    }
+    if input_wait_us.is_some_and(|duration| duration > latency_limit) {
+        missed.push("input_latency".to_string());
+    }
+    if active_interval_us.is_some_and(|duration| duration > cadence_limit) {
+        missed.push("cadence".to_string());
+    }
+    if phases
+        .iter()
+        .any(|phase| phase.duration_us > budget_us)
+    {
+        missed.push("phase".to_string());
+    }
+    missed
+}
+
 fn duration_us(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 fn decode_time(value: u64) -> Option<u64> {
-    (value > 0).then_some(value - 1)
+    (value > 0).then(|| value - 1)
 }
 
 #[macro_export]
@@ -946,6 +955,32 @@ macro_rules! busy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_timestamp_decodes_as_missing() {
+        assert_eq!(decode_time(0), None);
+        assert_eq!(decode_time(1), Some(0));
+    }
+
+    #[test]
+    fn frame_classifier_keeps_every_drop_reason() {
+        let phases = vec![Phase {
+            name: "render".to_string(),
+            duration_us: 20_000,
+        }];
+        assert_eq!(
+            classify_frame(
+                20_000,
+                Some(30_000),
+                Some(31_000),
+                Some(21_000),
+                &phases,
+                16_667,
+            ),
+            ["cpu", "redraw_latency", "input_latency", "cadence", "phase"]
+        );
+        assert!(classify_frame(4_000, None, None, None, &[], 16_667).is_empty());
+    }
 
     #[test]
     fn frame_summary_keeps_every_bucket_and_drop_count() {

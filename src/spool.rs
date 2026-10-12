@@ -156,7 +156,7 @@ fn report_priority(kind: &str) -> u8 {
         "panic" | "native_crash" | "process_exit" | "previous_unclean_exit" => 0,
         "hang" | "hang_continues" => 1,
         "stall" | "stall_recovered" => 2,
-        "frame_drops" => 3,
+        "frame_drops" | "slow_intervals" => 3,
         _ => 4,
     }
 }
@@ -252,15 +252,17 @@ mod tests {
     #[test]
     fn spool_bound_discards_summaries_before_crashes() {
         let root = temp_dir("living-telemetry-spool");
-        let spool = Spool::new(root.clone(), 1, None).unwrap();
+        let spool = Spool::new(root.clone(), u64::MAX, None).unwrap();
         spool.enqueue(report("runtime_summary"), Vec::new()).unwrap();
-        spool.enqueue(report("process_exit"), Vec::new()).unwrap();
+        let crash = spool.enqueue(report("process_exit"), Vec::new()).unwrap();
+        let crash_bytes = fs::metadata(crash).unwrap().len();
+        let bounded = Spool::new(root.clone(), crash_bytes, None).unwrap();
+        bounded.enforce_bound();
         let entries = spool_entries(&root).unwrap();
-        assert!(entries.len() <= 1);
-        if let Some(path) = entries.first() {
-            let envelope: SpoolEnvelope = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-            assert_eq!(envelope.report.kind, "process_exit");
-        }
+        assert_eq!(entries.len(), 1);
+        let envelope: SpoolEnvelope =
+            serde_json::from_slice(&fs::read(&entries[0]).unwrap()).unwrap();
+        assert_eq!(envelope.report.kind, "process_exit");
         let _ = fs::remove_dir_all(root);
     }
 }

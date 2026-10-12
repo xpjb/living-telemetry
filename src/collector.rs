@@ -375,6 +375,28 @@ mod tests {
     }
 
     #[test]
+    fn oversized_report_is_rejected_before_storage() {
+        let root = std::env::temp_dir().join(unique_id("living-telemetry-limit"));
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut config = CollectorConfig::new(address, root.clone());
+        config.max_report_bytes = 4;
+        let server = thread::spawn(move || serve(listener, &config, Some(1)).unwrap());
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .write_all(
+                b"POST /v1/report HTTP/1.1\r\nContent-Length: 5\r\nConnection: close\r\n\r\n12345",
+            )
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        server.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 500"));
+        assert!(!root.join("index.jsonl").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn report_round_trip_stores_topic_tree() {
         let root = std::env::temp_dir().join(unique_id("living-telemetry-collector"));
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
