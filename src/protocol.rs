@@ -143,6 +143,20 @@ impl Record {
             Self::Frame(frame) => frame.seq,
         }
     }
+
+    pub fn uptime_us(&self) -> u64 {
+        match self {
+            Self::Event(event) => event.uptime_us,
+            Self::Frame(frame) => frame.uptime_us,
+        }
+    }
+
+    pub fn duration_us(&self) -> u64 {
+        match self {
+            Self::Event(event) => event.duration_us.unwrap_or(0),
+            Self::Frame(frame) => frame.total_us,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -216,6 +230,8 @@ pub struct ProcessSample {
 pub struct Snapshot {
     pub unix_ms: u64,
     pub uptime_ms: u64,
+    #[serde(default = "default_frame_budget_us")]
+    pub frame_budget_us: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub busy: Option<BusyState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -224,6 +240,10 @@ pub struct Snapshot {
     pub records: Vec<Record>,
     pub frame_summary: FrameSummary,
     pub recorder_dropped: u64,
+}
+
+fn default_frame_budget_us() -> u64 {
+    16_667
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

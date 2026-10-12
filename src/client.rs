@@ -3,7 +3,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ChildStdin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
@@ -96,6 +96,8 @@ struct Client {
     frame_budget_us: AtomicU64,
     shutdown: AtomicBool,
     clean: AtomicBool,
+    report_wait: Mutex<()>,
+    report_signal: Condvar,
     reporter: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -154,6 +156,8 @@ pub fn init(config: Config) -> Result<(), String> {
         frame_budget_us: AtomicU64::new(duration_us(config.frame_budget).max(1)),
         shutdown: AtomicBool::new(false),
         clean: AtomicBool::new(false),
+        report_wait: Mutex::new(()),
+        report_signal: Condvar::new(),
         reporter: Mutex::new(None),
     });
     CLIENT
@@ -202,6 +206,7 @@ pub fn shutdown() {
     };
     client.clean.store(true, Ordering::Release);
     client.shutdown.store(true, Ordering::Release);
+    client.report_signal.notify_one();
     if let Some(handle) = client
         .reporter
         .lock()
@@ -216,7 +221,44 @@ pub fn report_panic(location: &str, payload: &str, backtrace: &str) {
     let Some(client) = CLIENT.get() else {
         return;
     };
-    let snapshot = client.snapshot_since(0);
+    let now_us = client.now_us();
+    let (state, records, frame_summary) = client.shared.try_lock().map_or_else(
+        |_| (Vec::new(), Vec::new(), FrameSummary::default()),
+        |shared| {
+            (
+                shared.state.clone(),
+                shared.records.iter().cloned().collect(),
+                shared.frame_summary.clone(),
+            )
+        },
+    );
+    let busy = (client.busy_depth.load(Ordering::Acquire) > 0).then(|| {
+        let since = decode_time(client.busy_since_us.load(Ordering::Acquire)).unwrap_or(now_us);
+        let progress = decode_time(client.last_progress_us.load(Ordering::Acquire)).unwrap_or(since);
+        let activity_id = client.activity.load(Ordering::Acquire);
+        let activity = client
+            .activities
+            .try_lock()
+            .ok()
+            .and_then(|activities| activities.get(&activity_id).cloned())
+            .unwrap_or_else(|| "ui.callback".to_string());
+        BusyState {
+            episode: client.busy_episode.load(Ordering::Acquire),
+            since_unix_ms: client.unix_for_us(since),
+            last_progress_unix_ms: client.unix_for_us(progress),
+            activity,
+        }
+    });
+    let snapshot = Snapshot {
+        unix_ms: client.unix_for_us(now_us),
+        uptime_ms: now_us / 1_000,
+        frame_budget_us: client.frame_budget_us.load(Ordering::Acquire),
+        busy,
+        state,
+        records,
+        frame_summary,
+        recorder_dropped: client.recorder_dropped.load(Ordering::Acquire),
+    };
     let report = client.report(
         "crash",
         "panic",
@@ -307,6 +349,7 @@ pub fn busy_registered(
         client.busy_episode.fetch_add(1, Ordering::AcqRel);
         client.busy_since_us.store(now_us + 1, Ordering::Release);
         client.last_progress_us.store(now_us + 1, Ordering::Release);
+        client.report_signal.notify_one();
     }
     BusyGuard {
         client: Some(client.clone()),
@@ -451,6 +494,20 @@ pub fn input_received() {
     let _ = client
         .input_received_us
         .compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire);
+}
+
+pub fn clear_pending_input() {
+    if let Some(client) = CLIENT.get() {
+        client.input_received_us.store(0, Ordering::Release);
+    }
+}
+
+pub fn clear_pending_frame() {
+    if let Some(client) = CLIENT.get() {
+        client.redraw_requested_us.store(0, Ordering::Release);
+        client.input_received_us.store(0, Ordering::Release);
+        client.next_frame_expected.store(false, Ordering::Release);
+    }
 }
 
 pub struct Frame {
@@ -727,6 +784,7 @@ impl Client {
         Snapshot {
             unix_ms: self.unix_for_us(now_us),
             uptime_ms: now_us / 1_000,
+            frame_budget_us: self.frame_budget_us.load(Ordering::Acquire),
             busy,
             state,
             records,
@@ -783,6 +841,7 @@ fn reporter_loop(client: Arc<Client>, launch: WatchdogLaunch) {
         if let Some(seq) = snapshot.records.last().map(Record::seq) {
             last_seq = last_seq.max(seq);
         }
+        let busy = snapshot.busy.is_some();
         let message = WatchMessage::Snapshot(snapshot.clone());
         let delivered = writer
             .as_mut()
@@ -805,7 +864,16 @@ fn reporter_loop(client: Arc<Client>, launch: WatchdogLaunch) {
             }
             break;
         }
-        thread::sleep(Duration::from_millis(100));
+        let delay = if busy {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_secs(1)
+        };
+        let guard = client
+            .report_wait
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = client.report_signal.wait_timeout(guard, delay);
     }
     drop(writer);
     if let Some((mut child, _)) = child.take() {

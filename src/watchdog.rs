@@ -165,6 +165,7 @@ impl Runtime {
             snapshot: Snapshot {
                 unix_ms: launch.start_unix_ms,
                 uptime_ms: 0,
+                frame_budget_us: 16_667,
                 busy: None,
                 state: Vec::new(),
                 records: Vec::new(),
@@ -189,11 +190,12 @@ impl Runtime {
 
     pub fn accept_snapshot(&mut self, mut snapshot: Snapshot) {
         let new_records = std::mem::take(&mut snapshot.records);
+        let frame_budget_us = snapshot.frame_budget_us.max(1);
         for record in new_records {
             if self.records.len() == self.launch.ring_capacity {
                 self.records.pop_front();
             }
-            if matches!(record, Record::Frame(_)) || is_slow_callback(&record) {
+            if matches!(record, Record::Frame(_)) || is_slow_interval(&record, frame_budget_us) {
                 self.performance.push(record.clone());
             }
             self.records.push_back(record);
@@ -217,9 +219,7 @@ impl Runtime {
     pub fn tick(&mut self) {
         let now = unix_ms();
         self.check_stall(now);
-        if now.saturating_sub(self.last_performance_ms) >= 10_000
-            && self.performance.iter().any(|record| matches!(record, Record::Frame(_)))
-        {
+        if now.saturating_sub(self.last_performance_ms) >= 10_000 && !self.performance.is_empty() {
             self.report_performance();
         }
         if now.saturating_sub(self.last_summary_ms) >= 60_000
@@ -246,7 +246,7 @@ impl Runtime {
             return;
         }
         self.cleaned = true;
-        if self.performance.iter().any(|record| matches!(record, Record::Frame(_))) {
+        if !self.performance.is_empty() {
             self.report_performance();
         }
         let _ = fs::remove_file(&self.checkpoint_path);
@@ -406,15 +406,43 @@ impl Runtime {
         if self.performance.is_empty() {
             return;
         }
-        let records = std::mem::take(&mut self.performance);
-        let dropped = records
+        let targets = std::mem::take(&mut self.performance);
+        let dropped = targets
             .iter()
             .filter(|record| matches!(record, Record::Frame(_)))
             .count();
+        let callbacks = targets.len().saturating_sub(dropped);
+        let start_us = targets
+            .iter()
+            .map(Record::uptime_us)
+            .min()
+            .unwrap_or(0)
+            .saturating_sub(50_000);
+        let end_us = targets
+            .iter()
+            .map(|record| record.uptime_us().saturating_add(record.duration_us()))
+            .max()
+            .unwrap_or(start_us)
+            .saturating_add(50_000);
+        let mut records = self
+            .records
+            .iter()
+            .filter(|record| (start_us..=end_us).contains(&record.uptime_us()))
+            .cloned()
+            .collect::<Vec<_>>();
+        for target in targets {
+            if !records.iter().any(|record| record.seq() == target.seq()) {
+                records.push(target);
+            }
+        }
+        records.sort_by_key(Record::seq);
         self.emit(
             "performance",
-            "frame_drops",
-            vec![Field::new("samples", dropped)],
+            "slow_intervals",
+            vec![
+                Field::new("frame_drops", dropped),
+                Field::new("slow_callbacks", callbacks),
+            ],
             Vec::new(),
             records,
         );
@@ -526,8 +554,13 @@ fn recover_stale_runs(launch: &WatchdogLaunch, spool: &Spool) {
     }
 }
 
-fn is_slow_callback(record: &Record) -> bool {
-    matches!(record, Record::Event(event) if event.name == "callback_over_budget")
+fn is_slow_interval(record: &Record, frame_budget_us: u64) -> bool {
+    matches!(
+        record,
+        Record::Event(event)
+            if event.name == "callback_over_budget"
+                || event.duration_us.is_some_and(|duration| duration > frame_budget_us)
+    )
 }
 
 #[cfg(test)]
@@ -562,6 +595,7 @@ mod tests {
         runtime.accept_snapshot(Snapshot {
             unix_ms: now,
             uptime_ms: 10,
+            frame_budget_us: 16_667,
             busy: None,
             state: Vec::new(),
             records: vec![Record::Frame(FrameRecord {
@@ -596,6 +630,7 @@ mod tests {
         runtime.accept_snapshot(Snapshot {
             unix_ms: now,
             uptime_ms: 10,
+            frame_budget_us: 16_667,
             busy: Some(BusyState {
                 episode: 1,
                 since_unix_ms: now - 100,
@@ -610,6 +645,7 @@ mod tests {
         runtime.accept_snapshot(Snapshot {
             unix_ms: now + 110,
             uptime_ms: 120,
+            frame_budget_us: 16_667,
             busy: None,
             state: Vec::new(),
             records: Vec::new(),
