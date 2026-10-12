@@ -153,7 +153,8 @@ impl Spool {
 
 fn report_priority(kind: &str) -> u8 {
     match kind {
-        "panic" | "native_crash" | "process_exit" | "previous_unclean_exit" => 0,
+        "panic" | "native_crash" | "process_exit" | "previous_unclean_exit"
+        | "watchdog_channel_closed" => 0,
         "hang" | "hang_continues" => 1,
         "stall" | "stall_recovered" => 2,
         "frame_drops" | "slow_intervals" => 3,
@@ -170,7 +171,7 @@ fn deletion_rank(envelope: &Option<SpoolEnvelope>) -> u8 {
 
 fn attachment_media_type(path: &Path) -> &'static str {
     match path.extension().and_then(|value| value.to_str()) {
-        Some("dmp") => "application/vnd.microsoft.portable-executable",
+        Some("dmp") => "application/x-minidump",
         _ => "application/octet-stream",
     }
 }

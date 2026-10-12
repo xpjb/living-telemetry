@@ -7,6 +7,8 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
+use arrayvec::ArrayVec;
+
 use crate::platform;
 use crate::protocol::{
     BusyState, EventRecord, Field, FrameRecord, FrameSummary, Phase, Record, Report,
@@ -66,7 +68,7 @@ struct Metadata {
 
 struct Shared {
     records: VecDeque<Record>,
-    state: Vec<Field>,
+    state: Arc<Vec<Field>>,
     frame_summary: FrameSummary,
 }
 
@@ -134,7 +136,7 @@ pub fn init(config: Config) -> Result<(), String> {
         slow_scope_us: duration_us(config.slow_scope),
         shared: Mutex::new(Shared {
             records: VecDeque::with_capacity(config.ring_capacity.min(4_096)),
-            state: Vec::new(),
+            state: Arc::new(Vec::new()),
             frame_summary: FrameSummary::default(),
         }),
         activities: Mutex::new(HashMap::new()),
@@ -226,7 +228,7 @@ pub fn report_panic(location: &str, payload: &str, backtrace: &str) {
         |_| (Vec::new(), Vec::new(), FrameSummary::default()),
         |shared| {
             (
-                shared.state.clone(),
+                shared.state.as_ref().clone(),
                 shared.records.iter().cloned().collect(),
                 shared.frame_summary.clone(),
             )
@@ -466,7 +468,7 @@ pub fn set_state(fields: Vec<Field>) {
         return;
     };
     match client.shared.try_lock() {
-        Ok(mut shared) => shared.state = fields,
+        Ok(mut shared) => shared.state = Arc::new(fields),
         Err(_) => {
             client.recorder_dropped.fetch_add(1, Ordering::Relaxed);
         }
@@ -511,6 +513,16 @@ pub fn clear_pending_frame() {
     }
 }
 
+struct PendingPhase {
+    name: &'static str,
+    duration_us: u64,
+}
+
+struct PendingField {
+    key: &'static str,
+    value: Value,
+}
+
 pub struct Frame {
     client: Option<Arc<Client>>,
     frame: u64,
@@ -521,8 +533,8 @@ pub struct Frame {
     active_interval_us: Option<u64>,
     current_phase: Option<&'static str>,
     phase_start: Instant,
-    phases: Vec<Phase>,
-    fields: Vec<Field>,
+    phases: ArrayVec<PendingPhase, 12>,
+    fields: ArrayVec<PendingField, 8>,
     finished: bool,
 }
 
@@ -551,8 +563,8 @@ impl Frame {
                 .then(|| start_us.saturating_sub(previous_start - 1)),
             current_phase: None,
             phase_start: start,
-            phases: Vec::with_capacity(12),
-            fields: Vec::new(),
+            phases: ArrayVec::new(),
+            fields: ArrayVec::new(),
             finished: false,
         }
     }
@@ -569,8 +581,8 @@ impl Frame {
             active_interval_us: None,
             current_phase: None,
             phase_start: now,
-            phases: Vec::new(),
-            fields: Vec::new(),
+            phases: ArrayVec::new(),
+            fields: ArrayVec::new(),
             finished: false,
         }
     }
@@ -581,8 +593,11 @@ impl Frame {
         self.phase_start = Instant::now();
     }
 
-    pub fn field(&mut self, key: impl Into<String>, value: impl Into<Value>) {
-        self.fields.push(Field::new(key, value));
+    pub fn field(&mut self, key: &'static str, value: impl Into<Value>) {
+        let _ = self.fields.try_push(PendingField {
+            key,
+            value: value.into(),
+        });
     }
 
     pub fn finish(mut self) {
@@ -591,8 +606,8 @@ impl Frame {
 
     fn close_phase(&mut self) {
         if let Some(name) = self.current_phase.take() {
-            self.phases.push(Phase {
-                name: name.to_string(),
+            let _ = self.phases.try_push(PendingPhase {
+                name,
                 duration_us: duration_us(self.phase_start.elapsed()),
             });
         }
@@ -639,8 +654,17 @@ impl Frame {
                     input_wait_us: self.input_wait_us,
                     active_interval_us: self.active_interval_us,
                     missed,
-                    phases: std::mem::take(&mut self.phases),
-                    fields: std::mem::take(&mut self.fields),
+                    phases: std::mem::take(&mut self.phases)
+                        .into_iter()
+                        .map(|phase| Phase {
+                            name: phase.name.to_string(),
+                            duration_us: phase.duration_us,
+                        })
+                        .collect(),
+                    fields: std::mem::take(&mut self.fields)
+                        .into_iter()
+                        .map(|field| Field::new(field.key, field.value))
+                        .collect(),
                 });
                 client.push_record(&mut shared, record);
             }
@@ -712,32 +736,23 @@ impl Client {
         shared.records.push_back(record);
     }
 
-    fn snapshot_since(&self, last_seq: u64) -> Snapshot {
+    fn snapshot(&self) -> Snapshot {
         let (state, records, frame_summary) = match self.shared.lock() {
-            Ok(shared) => (
+            Ok(mut shared) => (
                 shared.state.clone(),
-                shared
-                    .records
-                    .iter()
-                    .filter(|record| record.seq() > last_seq)
-                    .cloned()
-                    .collect(),
+                shared.records.drain(..).collect(),
                 shared.frame_summary.clone(),
             ),
             Err(poisoned) => {
-                let shared = poisoned.into_inner();
+                let mut shared = poisoned.into_inner();
                 (
                     shared.state.clone(),
-                    shared
-                        .records
-                        .iter()
-                        .filter(|record| record.seq() > last_seq)
-                        .cloned()
-                        .collect(),
+                    shared.records.drain(..).collect(),
                     shared.frame_summary.clone(),
                 )
             }
         };
+        let state = state.as_ref().clone();
         let now_us = self.now_us();
         let busy = if self.busy_depth.load(Ordering::Acquire) > 0 {
             let since = decode_time(self.busy_since_us.load(Ordering::Acquire)).unwrap_or(now_us);
@@ -745,10 +760,9 @@ impl Client {
             let activity_id = self.activity.load(Ordering::Acquire);
             let activity = self
                 .activities
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get(&activity_id)
-                .cloned()
+                .try_lock()
+                .ok()
+                .and_then(|activities| activities.get(&activity_id).cloned())
                 .unwrap_or_else(|| "ui.callback".to_string());
             Some(BusyState {
                 episode: self.busy_episode.load(Ordering::Acquire),
@@ -813,12 +827,8 @@ fn reporter_loop(client: Arc<Client>, launch: WatchdogLaunch) {
     let mut local = writer
         .is_none()
         .then(|| watchdog::Runtime::new(launch.clone()));
-    let mut last_seq = 0;
     loop {
-        let snapshot = client.snapshot_since(last_seq);
-        if let Some(seq) = snapshot.records.last().map(Record::seq) {
-            last_seq = last_seq.max(seq);
-        }
+        let snapshot = client.snapshot();
         let busy = snapshot.busy.is_some();
         let message = WatchMessage::Snapshot(snapshot.clone());
         let delivered = writer
@@ -837,7 +847,7 @@ fn reporter_loop(client: Arc<Client>, launch: WatchdogLaunch) {
                     let _ = write_message(writer, &WatchMessage::Clean { unix_ms: unix_ms() });
                 }
                 if let Some(runtime) = local.as_mut() {
-                    runtime.clean();
+                    runtime.clean(false);
                 }
             }
             break;
@@ -894,7 +904,7 @@ fn classify_frame(
     request_wait_us: Option<u64>,
     input_wait_us: Option<u64>,
     active_interval_us: Option<u64>,
-    phases: &[Phase],
+    phases: &[PendingPhase],
     budget_us: u64,
 ) -> Vec<String> {
     let latency_limit = budget_us.saturating_mul(3) / 2;
@@ -965,8 +975,8 @@ mod tests {
 
     #[test]
     fn frame_classifier_keeps_every_drop_reason() {
-        let phases = vec![Phase {
-            name: "render".to_string(),
+        let phases = vec![PendingPhase {
+            name: "render",
             duration_us: 20_000,
         }];
         assert_eq!(

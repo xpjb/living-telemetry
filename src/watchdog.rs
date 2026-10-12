@@ -77,10 +77,15 @@ fn run_sidecar(launch: WatchdogLaunch) -> Result<(), String> {
 
     let mut runtime = Runtime::new(launch);
     loop {
-        match receiver.recv_timeout(Duration::from_millis(50)) {
+        let timeout = if runtime.snapshot.busy.is_some() {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_secs(1)
+        };
+        match receiver.recv_timeout(timeout) {
             Ok(WatchMessage::Snapshot(snapshot)) => runtime.accept_snapshot(snapshot),
             Ok(WatchMessage::Clean { .. }) => {
-                runtime.clean();
+                runtime.clean(true);
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => runtime.tick(),
@@ -142,7 +147,7 @@ impl Runtime {
                 let handle = thread::Builder::new()
                     .name("living-telemetry-uploader".to_string())
                     .spawn(move || loop {
-                        match receiver.recv_timeout(Duration::from_secs(10)) {
+                        match receiver.recv_timeout(Duration::from_secs(30)) {
                             Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => uploader.flush(),
                             Err(mpsc::RecvTimeoutError::Disconnected) => {
                                 uploader.flush();
@@ -235,13 +240,18 @@ impl Runtime {
             self.last_summary_ms = now;
             self.last_summary_frames = self.snapshot.frame_summary.frames;
         }
-        if now.saturating_sub(self.last_checkpoint_ms) >= 2_000 {
+        let checkpoint_interval_ms = if self.snapshot.busy.is_some() {
+            2_000
+        } else {
+            30_000
+        };
+        if now.saturating_sub(self.last_checkpoint_ms) >= checkpoint_interval_ms {
             self.write_checkpoint();
             self.last_checkpoint_ms = now;
         }
     }
 
-    pub fn clean(&mut self) {
+    pub fn clean(&mut self, wait_for_upload: bool) {
         if self.cleaned {
             return;
         }
@@ -251,7 +261,13 @@ impl Runtime {
         }
         let _ = fs::remove_file(&self.checkpoint_path);
         self.flush_sender.take();
-        self.uploader.take();
+        if wait_for_upload {
+            if let Some(uploader) = self.uploader.take() {
+                let _ = uploader.join();
+            }
+        } else {
+            self.uploader.take();
+        }
     }
 
     pub fn unclean_exit(&mut self) {
@@ -647,7 +663,7 @@ mod tests {
             .filter_map(|bytes| serde_json::from_slice::<SpoolEnvelope>(&bytes).ok())
             .collect::<Vec<_>>();
         assert!(reports.iter().any(|report| report.report.kind == "stall"));
-        runtime.clean();
+        runtime.clean(false);
         let _ = fs::remove_dir_all(root);
     }
 
