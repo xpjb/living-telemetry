@@ -16,6 +16,7 @@ use crate::spool::{Spool, atomic_json};
 
 const WATCHDOG_ARG: &str = "--living-telemetry-watchdog";
 const WATCHDOG_CONFIG: &str = "LIVING_TELEMETRY_WATCHDOG_CONFIG";
+const SNAPSHOT_FRESH_MS: u64 = 3_000;
 
 pub(crate) fn spawn(launch: &WatchdogLaunch) -> Result<(Child, Option<ChildStdin>), String> {
     let executable = std::env::current_exe().map_err(|err| err.to_string())?;
@@ -306,6 +307,9 @@ impl Runtime {
     }
 
     fn check_stall(&mut self, now: u64) {
+        if now.saturating_sub(self.snapshot.unix_ms) > SNAPSHOT_FRESH_MS {
+            return;
+        }
         let Some(busy) = self.snapshot.busy.clone() else {
             return;
         };
@@ -663,6 +667,39 @@ mod tests {
             .filter_map(|bytes| serde_json::from_slice::<SpoolEnvelope>(&bytes).ok())
             .collect::<Vec<_>>();
         assert!(reports.iter().any(|report| report.report.kind == "stall"));
+        runtime.clean(false);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_snapshot_does_not_report_a_ui_hang() {
+        let root = std::env::temp_dir().join(unique_id("living-telemetry-stale-snapshot"));
+        let mut runtime = Runtime::new(launch(root.clone()));
+        let now = unix_ms();
+        runtime.accept_snapshot(Snapshot {
+            unix_ms: now - SNAPSHOT_FRESH_MS - 1,
+            uptime_ms: 300,
+            frame_budget_us: 16_667,
+            busy: Some(BusyState {
+                episode: 1,
+                since_unix_ms: now - 10_000,
+                last_progress_unix_ms: now - 10_000,
+                activity: "test.stale".to_string(),
+            }),
+            state: Vec::new(),
+            records: Vec::new(),
+            frame_summary: FrameSummary::default(),
+            recorder_dropped: 0,
+        });
+        let reports = fs::read_dir(root.join("spool"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read(entry.path()).ok())
+            .filter_map(|bytes| serde_json::from_slice::<SpoolEnvelope>(&bytes).ok())
+            .collect::<Vec<_>>();
+        assert!(!reports.iter().any(|report| {
+            matches!(report.report.kind.as_str(), "stall" | "hang" | "hang_continues")
+        }));
         runtime.clean(false);
         let _ = fs::remove_dir_all(root);
     }
