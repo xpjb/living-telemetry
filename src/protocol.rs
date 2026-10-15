@@ -247,9 +247,17 @@ fn default_frame_budget_us() -> u64 {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ReportRequest {
+    pub topic: String,
+    pub kind: String,
+    pub fields: Vec<Field>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "message", rename_all = "snake_case")]
 pub enum WatchMessage {
     Snapshot(Snapshot),
+    Report(ReportRequest),
     Clean { unix_ms: u64 },
 }
 

@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use crate::platform;
 use crate::protocol::{
-    Field, FrameSummary, Record, Report, RunCheckpoint, SCHEMA_VERSION, Snapshot, WatchMessage,
-    WatchdogLaunch, unique_id, unix_ms,
+    Field, FrameSummary, Record, Report, ReportRequest, RunCheckpoint, SCHEMA_VERSION, Snapshot,
+    WatchMessage, WatchdogLaunch, unique_id, unix_ms,
 };
 use crate::spool::{Spool, atomic_json};
 
@@ -85,6 +85,7 @@ fn run_sidecar(launch: WatchdogLaunch) -> Result<(), String> {
         };
         match receiver.recv_timeout(timeout) {
             Ok(WatchMessage::Snapshot(snapshot)) => runtime.accept_snapshot(snapshot),
+            Ok(WatchMessage::Report(report)) => runtime.report(report),
             Ok(WatchMessage::Clean { .. }) => {
                 runtime.clean(true);
                 break;
@@ -220,6 +221,17 @@ impl Runtime {
             self.report_performance();
         }
         self.tick();
+    }
+
+    pub fn report(&mut self, report: ReportRequest) {
+        let records = self.records.iter().cloned().collect();
+        self.emit(
+            &report.topic,
+            &report.kind,
+            report.fields,
+            Vec::new(),
+            records,
+        );
     }
 
     pub fn tick(&mut self) {
@@ -584,7 +596,7 @@ fn is_slow_interval(record: &Record, frame_budget_us: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{BusyState, FrameRecord, Phase, SpoolEnvelope};
+    use crate::protocol::{BusyState, FrameRecord, Phase, ReportRequest, SpoolEnvelope};
 
     fn launch(root: PathBuf) -> WatchdogLaunch {
         WatchdogLaunch {
@@ -637,6 +649,40 @@ mod tests {
             recorder_dropped: 0,
         });
         assert_eq!(runtime.performance.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_report_spools_current_state_and_context() {
+        let root = std::env::temp_dir().join(unique_id("living-telemetry-explicit"));
+        let mut runtime = Runtime::new(launch(root.clone()));
+        let now = unix_ms();
+        runtime.accept_snapshot(Snapshot {
+            unix_ms: now,
+            uptime_ms: 10,
+            frame_budget_us: 16_667,
+            busy: None,
+            state: vec![Field::new("seed", 60021u32)],
+            records: Vec::new(),
+            frame_summary: FrameSummary::default(),
+            recorder_dropped: 0,
+        });
+        runtime.report(ReportRequest {
+            topic: "feedback".to_string(),
+            kind: "repro".to_string(),
+            fields: vec![Field::new("position_x", 12.5f64)],
+        });
+        let reports = fs::read_dir(root.join("spool"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read(entry.path()).ok())
+            .filter_map(|bytes| serde_json::from_slice::<SpoolEnvelope>(&bytes).ok())
+            .collect::<Vec<_>>();
+        let report = reports.iter().find(|report| report.report.kind == "repro").unwrap();
+        assert_eq!(report.report.topic, "feedback");
+        assert_eq!(report.report.state, vec![Field::new("seed", 60021i64)]);
+        assert_eq!(report.report.fields, vec![Field::new("position_x", 12.5f64)]);
+        runtime.clean(false);
         let _ = fs::remove_dir_all(root);
     }
 

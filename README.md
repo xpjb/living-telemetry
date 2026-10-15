@@ -25,8 +25,10 @@ fn main() {
 Use `busy!` around UI callbacks, `scope!` around meaningful phases, call
 `redraw_requested()` and `input_received()` at the event boundary, and wrap each
 paint with `Frame::start()`, `phase()`, and `finish()`. `set_state()` publishes
-content-free identifiers and counts for incident context. `report_panic()` can be
-called from an existing panic hook.
+content-free identifiers and counts for incident context. `event_duration()` records
+work that spans asynchronous boundaries. `report()` queues an immediate bounded
+report such as an explicit user repro snapshot. `report_panic()` can be called from
+an existing panic hook.
 
 The UI path performs clock reads, atomics, and bounded in-memory writes. A reporter
 thread and same-executable watchdog own serialization, disk, HTTP, process sampling,

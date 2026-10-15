@@ -12,12 +12,14 @@ use arrayvec::ArrayVec;
 use crate::platform;
 use crate::protocol::{
     BusyState, EventRecord, Field, FrameRecord, FrameSummary, Phase, Record, Report,
-    SCHEMA_VERSION, Snapshot, Value, WatchMessage, WatchdogLaunch, unique_id, unix_ms,
+    ReportRequest, SCHEMA_VERSION, Snapshot, Value, WatchMessage, WatchdogLaunch, unique_id,
+    unix_ms,
 };
 use crate::spool::Spool;
 use crate::watchdog;
 
 static CLIENT: OnceLock<Arc<Client>> = OnceLock::new();
+const PENDING_REPORTS: usize = 64;
 
 pub struct Config {
     pub app: String,
@@ -68,6 +70,7 @@ struct Metadata {
 
 struct Shared {
     records: VecDeque<Record>,
+    reports: VecDeque<ReportRequest>,
     state: Arc<Vec<Field>>,
     frame_summary: FrameSummary,
 }
@@ -136,6 +139,7 @@ pub fn init(config: Config) -> Result<(), String> {
         slow_scope_us: duration_us(config.slow_scope),
         shared: Mutex::new(Shared {
             records: VecDeque::with_capacity(config.ring_capacity.min(4_096)),
+            reports: VecDeque::with_capacity(PENDING_REPORTS),
             state: Arc::new(Vec::new()),
             frame_summary: FrameSummary::default(),
         }),
@@ -463,6 +467,40 @@ pub fn event(category: &'static str, name: &'static str, fields: Vec<Field>) {
     }
 }
 
+pub fn event_duration(
+    category: &'static str,
+    name: &'static str,
+    duration: Duration,
+    fields: Vec<Field>,
+) {
+    if let Some(client) = CLIENT.get() {
+        client.record_event(category, name, Some(duration_us(duration)), fields);
+    }
+}
+
+pub fn report(topic: &'static str, kind: &'static str, fields: Vec<Field>) -> bool {
+    let Some(client) = CLIENT.get() else {
+        return false;
+    };
+    {
+        let mut shared = client
+            .shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if shared.reports.len() == PENDING_REPORTS {
+            shared.reports.pop_front();
+            client.recorder_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        shared.reports.push_back(ReportRequest {
+            topic: topic.to_string(),
+            kind: kind.to_string(),
+            fields,
+        });
+    }
+    client.report_signal.notify_one();
+    true
+}
+
 pub fn set_state(fields: Vec<Field>) {
     let Some(client) = CLIENT.get() else {
         return;
@@ -736,11 +774,12 @@ impl Client {
         shared.records.push_back(record);
     }
 
-    fn snapshot(&self) -> Snapshot {
-        let (state, records, frame_summary) = match self.shared.lock() {
+    fn snapshot(&self) -> (Snapshot, Vec<ReportRequest>) {
+        let (state, records, reports, frame_summary) = match self.shared.lock() {
             Ok(mut shared) => (
                 shared.state.clone(),
                 shared.records.drain(..).collect(),
+                shared.reports.drain(..).collect(),
                 shared.frame_summary.clone(),
             ),
             Err(poisoned) => {
@@ -748,6 +787,7 @@ impl Client {
                 (
                     shared.state.clone(),
                     shared.records.drain(..).collect(),
+                    shared.reports.drain(..).collect(),
                     shared.frame_summary.clone(),
                 )
             }
@@ -773,7 +813,7 @@ impl Client {
         } else {
             None
         };
-        Snapshot {
+        (Snapshot {
             unix_ms: self.unix_for_us(now_us),
             uptime_ms: now_us / 1_000,
             frame_budget_us: self.frame_budget_us.load(Ordering::Acquire),
@@ -782,7 +822,7 @@ impl Client {
             records,
             frame_summary,
             recorder_dropped: self.recorder_dropped.load(Ordering::Acquire),
-        }
+        }, reports)
     }
 
     fn report(
@@ -828,17 +868,33 @@ fn reporter_loop(client: Arc<Client>, launch: WatchdogLaunch) {
         .is_none()
         .then(|| watchdog::Runtime::new(launch.clone()));
     loop {
-        let snapshot = client.snapshot();
+        let (snapshot, reports) = client.snapshot();
         let busy = snapshot.busy.is_some();
         let message = WatchMessage::Snapshot(snapshot.clone());
         let delivered = writer
             .as_mut()
             .is_some_and(|writer| write_message(writer, &message).is_ok());
+        let mut fallback_synced = false;
         if !delivered {
             writer = None;
             let runtime = local.get_or_insert_with(|| watchdog::Runtime::new(launch.clone()));
-            runtime.accept_snapshot(snapshot);
+            runtime.accept_snapshot(snapshot.clone());
             runtime.tick();
+            fallback_synced = true;
+        }
+        for report in reports {
+            let delivered = writer
+                .as_mut()
+                .is_some_and(|writer| write_message(writer, &WatchMessage::Report(report.clone())).is_ok());
+            if !delivered {
+                writer = None;
+                let runtime = local.get_or_insert_with(|| watchdog::Runtime::new(launch.clone()));
+                if !fallback_synced {
+                    runtime.accept_snapshot(snapshot.clone());
+                    fallback_synced = true;
+                }
+                runtime.report(report);
+            }
         }
         if client.shutdown.load(Ordering::Acquire) {
             let clean = client.clean.load(Ordering::Acquire);
