@@ -10,7 +10,7 @@ pub use client::{
     BusyGuard, Config, Frame, Scope, busy_registered, clear_pending_frame,
     clear_pending_input, event, event_duration, frame_budget, init, input_received,
     redraw_requested, register_activity, report, report_panic, scope_registered,
-    set_frame_budget, set_state, shutdown,
+    set_frame_budget, set_state, set_ui_active, shutdown,
 };
 pub use collector::{
     CollectorConfig, run as run_collector, tailnet_or_loopback, validate_bind,

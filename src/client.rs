@@ -79,6 +79,8 @@ struct Client {
     metadata: Metadata,
     started: Instant,
     ui_thread: ThreadId,
+    ui_active: AtomicBool,
+    ui_epoch: AtomicU64,
     ring_capacity: usize,
     slow_scope_us: u64,
     shared: Mutex<Shared>,
@@ -135,6 +137,8 @@ pub fn init(config: Config) -> Result<(), String> {
         metadata,
         started: Instant::now(),
         ui_thread: thread::current().id(),
+        ui_active: AtomicBool::new(true),
+        ui_epoch: AtomicU64::new(1),
         ring_capacity: config.ring_capacity.max(64),
         slow_scope_us: duration_us(config.slow_scope),
         shared: Mutex::new(Shared {
@@ -238,23 +242,25 @@ pub fn report_panic(location: &str, payload: &str, backtrace: &str) {
             )
         },
     );
-    let busy = (client.busy_depth.load(Ordering::Acquire) > 0).then(|| {
-        let since = decode_time(client.busy_since_us.load(Ordering::Acquire)).unwrap_or(now_us);
-        let progress = decode_time(client.last_progress_us.load(Ordering::Acquire)).unwrap_or(since);
-        let activity_id = client.activity.load(Ordering::Acquire);
-        let activity = client
-            .activities
-            .try_lock()
-            .ok()
-            .and_then(|activities| activities.get(&activity_id).cloned())
-            .unwrap_or_else(|| "ui.callback".to_string());
-        BusyState {
-            episode: client.busy_episode.load(Ordering::Acquire),
-            since_unix_ms: client.unix_for_us(since),
-            last_progress_unix_ms: client.unix_for_us(progress),
-            activity,
-        }
-    });
+    let busy = (client.ui_active.load(Ordering::Acquire)
+        && client.busy_depth.load(Ordering::Acquire) > 0)
+        .then(|| {
+            let since = decode_time(client.busy_since_us.load(Ordering::Acquire)).unwrap_or(now_us);
+            let progress = decode_time(client.last_progress_us.load(Ordering::Acquire)).unwrap_or(since);
+            let activity_id = client.activity.load(Ordering::Acquire);
+            let activity = client
+                .activities
+                .try_lock()
+                .ok()
+                .and_then(|activities| activities.get(&activity_id).cloned())
+                .unwrap_or_else(|| "ui.callback".to_string());
+            BusyState {
+                episode: client.busy_episode.load(Ordering::Acquire),
+                since_unix_ms: client.unix_for_us(since),
+                last_progress_unix_ms: client.unix_for_us(progress),
+                activity,
+            }
+        });
     let snapshot = Snapshot {
         unix_ms: client.unix_for_us(now_us),
         uptime_ms: now_us / 1_000,
@@ -293,6 +299,40 @@ pub fn set_frame_budget(budget: Duration) {
     }
 }
 
+/// Enables UI timing only while the host can run and present normally.
+/// Changing this state invalidates open UI scopes, callbacks, and frames so
+/// background suspension cannot become a slow interval or dropped frame.
+pub fn set_ui_active(active: bool) {
+    let Some(client) = CLIENT.get() else {
+        return;
+    };
+    if client.ui_active.load(Ordering::Acquire) == active {
+        return;
+    }
+    client.ui_epoch.fetch_add(1, Ordering::AcqRel);
+    client.ui_active.store(false, Ordering::Release);
+    client.clear_frame_timing();
+    client.frame_active.store(false, Ordering::Release);
+    client.activity.store(0, Ordering::Release);
+    client.activity_started_us.store(0, Ordering::Release);
+    if active {
+        if client.busy_depth.load(Ordering::Acquire) > 0 {
+            let now = client.now_us() + 1;
+            client.busy_episode.fetch_add(1, Ordering::AcqRel);
+            client.busy_since_us.store(now, Ordering::Release);
+            client.last_progress_us.store(now, Ordering::Release);
+        } else {
+            client.busy_since_us.store(0, Ordering::Release);
+            client.last_progress_us.store(0, Ordering::Release);
+        }
+        client.ui_active.store(true, Ordering::Release);
+    } else {
+        client.busy_since_us.store(0, Ordering::Release);
+        client.last_progress_us.store(0, Ordering::Release);
+    }
+    client.report_signal.notify_one();
+}
+
 pub fn frame_budget() -> Duration {
     CLIENT
         .get()
@@ -323,6 +363,10 @@ pub fn scope_registered(
         return Scope::inactive();
     };
     let ui = thread::current().id() == client.ui_thread;
+    if ui && !client.ui_active.load(Ordering::Acquire) {
+        return Scope::inactive();
+    }
+    let ui_epoch = ui.then(|| client.ui_epoch.load(Ordering::Acquire));
     let now_us = client.now_us();
     let previous = if ui {
         let previous_id = client.activity.swap(id, Ordering::AcqRel);
@@ -338,6 +382,7 @@ pub fn scope_registered(
         name,
         start: Instant::now(),
         ui_previous: previous,
+        ui_epoch,
     }
 }
 
@@ -350,6 +395,10 @@ pub fn busy_registered(
     let Some(client) = CLIENT.get() else {
         return BusyGuard::inactive();
     };
+    if !client.ui_active.load(Ordering::Acquire) {
+        return BusyGuard::inactive();
+    }
+    let ui_epoch = client.ui_epoch.load(Ordering::Acquire);
     let now_us = client.now_us();
     if client.busy_depth.fetch_add(1, Ordering::AcqRel) == 0 {
         client.busy_episode.fetch_add(1, Ordering::AcqRel);
@@ -363,6 +412,7 @@ pub fn busy_registered(
         category,
         name,
         start: Instant::now(),
+        ui_epoch,
     }
 }
 
@@ -372,6 +422,7 @@ pub struct Scope {
     name: &'static str,
     start: Instant,
     ui_previous: Option<(u64, u64)>,
+    ui_epoch: Option<u64>,
 }
 
 impl Scope {
@@ -382,6 +433,7 @@ impl Scope {
             name: "",
             start: Instant::now(),
             ui_previous: None,
+            ui_epoch: None,
         }
     }
 }
@@ -392,7 +444,16 @@ impl Drop for Scope {
             return;
         };
         let duration_us = duration_us(self.start.elapsed());
-        if let Some((previous_id, previous_started)) = self.ui_previous {
+        let current = self.ui_epoch.is_none_or(|epoch| {
+            interval_is_current(
+                client.ui_active.load(Ordering::Acquire),
+                client.ui_epoch.load(Ordering::Acquire),
+                epoch,
+            )
+        });
+        if current
+            && let Some((previous_id, previous_started)) = self.ui_previous
+        {
             client.activity.store(previous_id, Ordering::Release);
             client
                 .activity_started_us
@@ -401,7 +462,7 @@ impl Drop for Scope {
                 .last_progress_us
                 .store(client.now_us() + 1, Ordering::Release);
         }
-        if duration_us >= client.slow_scope_us {
+        if current && duration_us >= client.slow_scope_us {
             client.record_event(
                 self.category,
                 self.name,
@@ -418,6 +479,7 @@ pub struct BusyGuard {
     category: &'static str,
     name: &'static str,
     start: Instant,
+    ui_epoch: u64,
 }
 
 impl BusyGuard {
@@ -428,6 +490,7 @@ impl BusyGuard {
             category: "",
             name: "",
             start: Instant::now(),
+            ui_epoch: 0,
         }
     }
 }
@@ -447,7 +510,12 @@ impl Drop for BusyGuard {
         }
         let duration_us = duration_us(self.start.elapsed());
         let budget_us = client.frame_budget_us.load(Ordering::Acquire);
-        if duration_us > budget_us {
+        let current = interval_is_current(
+            client.ui_active.load(Ordering::Acquire),
+            client.ui_epoch.load(Ordering::Acquire),
+            self.ui_epoch,
+        );
+        if current && duration_us > budget_us {
             client.record_event(
                 self.category,
                 "callback_over_budget",
@@ -517,6 +585,9 @@ pub fn redraw_requested() {
     let Some(client) = CLIENT.get() else {
         return;
     };
+    if !client.ui_active.load(Ordering::Acquire) {
+        return;
+    }
     let now = client.now_us() + 1;
     let _ = client
         .redraw_requested_us
@@ -530,6 +601,9 @@ pub fn input_received() -> bool {
     let Some(client) = CLIENT.get() else {
         return false;
     };
+    if !client.ui_active.load(Ordering::Acquire) {
+        return false;
+    }
     let now = client.now_us() + 1;
     client
         .input_received_us
@@ -545,9 +619,7 @@ pub fn clear_pending_input() {
 
 pub fn clear_pending_frame() {
     if let Some(client) = CLIENT.get() {
-        client.redraw_requested_us.store(0, Ordering::Release);
-        client.input_received_us.store(0, Ordering::Release);
-        client.next_frame_expected.store(false, Ordering::Release);
+        client.clear_frame_timing();
     }
 }
 
@@ -573,6 +645,7 @@ pub struct Frame {
     phase_start: Instant,
     phases: ArrayVec<PendingPhase, 12>,
     fields: ArrayVec<PendingField, 8>,
+    ui_epoch: u64,
     finished: bool,
 }
 
@@ -581,6 +654,10 @@ impl Frame {
         let Some(client) = CLIENT.get() else {
             return Self::inactive();
         };
+        if !client.ui_active.load(Ordering::Acquire) {
+            return Self::inactive();
+        }
+        let ui_epoch = client.ui_epoch.load(Ordering::Acquire);
         let start = Instant::now();
         let start_us = client.now_us();
         client.frame_active.store(true, Ordering::Release);
@@ -603,6 +680,7 @@ impl Frame {
             phase_start: start,
             phases: ArrayVec::new(),
             fields: ArrayVec::new(),
+            ui_epoch,
             finished: false,
         }
     }
@@ -621,6 +699,7 @@ impl Frame {
             phase_start: now,
             phases: ArrayVec::new(),
             fields: ArrayVec::new(),
+            ui_epoch: 0,
             finished: false,
         }
     }
@@ -660,6 +739,14 @@ impl Frame {
         let Some(client) = &self.client else {
             return;
         };
+        client.frame_active.store(false, Ordering::Release);
+        if !interval_is_current(
+            client.ui_active.load(Ordering::Acquire),
+            client.ui_epoch.load(Ordering::Acquire),
+            self.ui_epoch,
+        ) {
+            return;
+        }
         let total_us = duration_us(self.start.elapsed());
         let budget_us = client.frame_budget_us.load(Ordering::Acquire).max(1);
         let missed = classify_frame(
@@ -709,7 +796,6 @@ impl Frame {
         } else {
             client.recorder_dropped.fetch_add(1, Ordering::Relaxed);
         }
-        client.frame_active.store(false, Ordering::Release);
         client
             .last_progress_us
             .store(client.now_us() + 1, Ordering::Release);
@@ -723,6 +809,13 @@ impl Drop for Frame {
 }
 
 impl Client {
+    fn clear_frame_timing(&self) {
+        self.redraw_requested_us.store(0, Ordering::Release);
+        self.input_received_us.store(0, Ordering::Release);
+        self.next_frame_expected.store(false, Ordering::Release);
+        self.last_frame_start_us.store(0, Ordering::Release);
+    }
+
     fn now_us(&self) -> u64 {
         duration_us(self.started.elapsed())
     }
@@ -794,7 +887,9 @@ impl Client {
         };
         let state = state.as_ref().clone();
         let now_us = self.now_us();
-        let busy = if self.busy_depth.load(Ordering::Acquire) > 0 {
+        let busy = if self.ui_active.load(Ordering::Acquire)
+            && self.busy_depth.load(Ordering::Acquire) > 0
+        {
             let since = decode_time(self.busy_since_us.load(Ordering::Acquire)).unwrap_or(now_us);
             let progress = decode_time(self.last_progress_us.load(Ordering::Acquire)).unwrap_or(since);
             let activity_id = self.activity.load(Ordering::Acquire);
@@ -987,6 +1082,10 @@ fn classify_frame(
     missed
 }
 
+fn interval_is_current(active: bool, current_epoch: u64, interval_epoch: u64) -> bool {
+    active && current_epoch == interval_epoch
+}
+
 fn duration_us(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
@@ -1027,6 +1126,13 @@ mod tests {
     fn zero_timestamp_decodes_as_missing() {
         assert_eq!(decode_time(0), None);
         assert_eq!(decode_time(1), Some(0));
+    }
+
+    #[test]
+    fn ui_state_change_invalidates_open_intervals() {
+        assert!(interval_is_current(true, 7, 7));
+        assert!(!interval_is_current(false, 7, 7));
+        assert!(!interval_is_current(true, 8, 7));
     }
 
     #[test]
