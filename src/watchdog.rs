@@ -46,7 +46,9 @@ pub fn run_from_args() -> bool {
     }
     let result = std::env::var(WATCHDOG_CONFIG)
         .map_err(|err| err.to_string())
-        .and_then(|value| serde_json::from_str::<WatchdogLaunch>(&value).map_err(|err| err.to_string()))
+        .and_then(|value| {
+            serde_json::from_str::<WatchdogLaunch>(&value).map_err(|err| err.to_string())
+        })
         .and_then(run_sidecar);
     if let Err(err) = result {
         let _ = fs::write(
@@ -148,19 +150,23 @@ impl Runtime {
                 let (sender, receiver) = mpsc::sync_channel(1);
                 let handle = thread::Builder::new()
                     .name("living-telemetry-uploader".to_string())
-                    .spawn(move || loop {
-                        match receiver.recv_timeout(Duration::from_secs(30)) {
-                            Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => uploader.flush(),
-                            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                                uploader.flush();
-                                break;
+                    .spawn(move || {
+                        loop {
+                            match receiver.recv_timeout(Duration::from_secs(30)) {
+                                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => uploader.flush(),
+                                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                    uploader.flush();
+                                    break;
+                                }
                             }
                         }
                     })
                     .ok()?;
                 Some((sender, handle))
             })
-            .map_or((None, None), |(sender, handle)| (Some(sender), Some(handle)));
+            .map_or((None, None), |(sender, handle)| {
+                (Some(sender), Some(handle))
+            });
         if let Some(sender) = &flush_sender {
             let _ = sender.try_send(());
         }
@@ -209,11 +215,9 @@ impl Runtime {
         }
         if snapshot.busy.is_none() {
             self.report_recovery(snapshot.unix_ms);
-        } else if self
-            .incident
-            .as_ref()
-            .is_some_and(|incident| Some(incident.episode) != snapshot.busy.as_ref().map(|busy| busy.episode))
-        {
+        } else if self.incident.as_ref().is_some_and(|incident| {
+            Some(incident.episode) != snapshot.busy.as_ref().map(|busy| busy.episode)
+        }) {
             self.report_recovery(snapshot.unix_ms);
         }
         self.snapshot = snapshot;
@@ -288,11 +292,12 @@ impl Runtime {
             return;
         }
         self.cleaned = true;
-        let alive = platform::process_alive(
-            self.launch.parent_pid,
-            self.launch.parent_start_token,
-        );
-        let dump = self.launch.native_dump_path.exists().then(|| self.launch.native_dump_path.clone());
+        let alive = platform::process_alive(self.launch.parent_pid, self.launch.parent_start_token);
+        let dump = self
+            .launch
+            .native_dump_path
+            .exists()
+            .then(|| self.launch.native_dump_path.clone());
         let kind = if dump.is_some() {
             "native_crash"
         } else if alive {
@@ -339,7 +344,13 @@ impl Runtime {
                 last_continuation_ms: now,
             });
         }
-        let stale_ms = now.saturating_sub(busy.last_progress_unix_ms);
+        // A queued snapshot is evidence only up to its own sampling time.
+        // Counting IPC/spool delay as UI time creates false hangs (and costly
+        // Windows dumps) for callbacks which have already finished.
+        let stale_ms = self
+            .snapshot
+            .unix_ms
+            .saturating_sub(busy.last_progress_unix_ms);
         let stall_ms = self.launch.stall_ms;
         let hang_ms = self.launch.hang_ms.max(stall_ms);
         let mut emit_stall = false;
@@ -365,12 +376,14 @@ impl Runtime {
                 emit_continuation = true;
             }
         }
+        let sampled_at = self.snapshot.unix_ms;
         let common = || {
             vec![
                 Field::new("episode", busy.episode),
                 Field::new("activity", busy.activity.clone()),
                 Field::new("stale_ms", stale_ms),
-                Field::new("busy_ms", now.saturating_sub(busy.since_unix_ms)),
+                Field::new("busy_ms", sampled_at.saturating_sub(busy.since_unix_ms)),
+                Field::new("watchdog_lag_ms", now.saturating_sub(sampled_at)),
             ]
         };
         if emit_stall {
@@ -576,7 +589,10 @@ fn recover_stale_runs(launch: &WatchdogLaunch, spool: &Spool) {
             frame_summary: checkpoint.snapshot.frame_summary,
             recorder_dropped: checkpoint.snapshot.recorder_dropped,
             records: checkpoint.records,
-            fields: vec![Field::new("checkpoint_unix_ms", checkpoint.snapshot.unix_ms)],
+            fields: vec![Field::new(
+                "checkpoint_unix_ms",
+                checkpoint.snapshot.unix_ms,
+            )],
             attachments: Vec::new(),
         };
         let _ = spool.enqueue(report, dump.into_iter().collect());
@@ -746,6 +762,61 @@ mod tests {
         assert!(!reports.iter().any(|report| {
             matches!(report.report.kind.as_str(), "stall" | "hang" | "hang_continues")
         }));
+        runtime.clean(false);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn queued_short_callback_is_not_a_three_second_hang() {
+        let root = std::env::temp_dir().join(unique_id("living-telemetry-queued"));
+        let mut runtime = Runtime::new(launch(root.clone()));
+        let now = unix_ms();
+        runtime.accept_snapshot(Snapshot {
+            unix_ms: now - 2_900,
+            uptime_ms: 100,
+            frame_budget_us: 16_667,
+            busy: Some(BusyState {
+                episode: 1,
+                since_unix_ms: now - 2_925,
+                last_progress_unix_ms: now - 2_925,
+                activity: "frame.surface_acquire".to_string(),
+            }),
+            state: Vec::new(),
+            records: Vec::new(),
+            frame_summary: FrameSummary::default(),
+            recorder_dropped: 0,
+        });
+        runtime.check_stall(now);
+        assert!(!runtime.incident.as_ref().unwrap().stall_reported);
+        assert!(!runtime.incident.as_ref().unwrap().hang_reported);
+        // Waiting for the next heartbeat is not additional UI-stall evidence.
+        runtime.check_stall(now + 50);
+        assert!(!runtime.incident.as_ref().unwrap().stall_reported);
+        runtime.clean(false);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fresh_heartbeats_still_detect_a_real_ui_hang() {
+        let root = std::env::temp_dir().join(unique_id("living-telemetry-real-hang"));
+        let mut runtime = Runtime::new(launch(root.clone()));
+        let now = unix_ms();
+        runtime.accept_snapshot(Snapshot {
+            unix_ms: now,
+            uptime_ms: 2_100,
+            frame_budget_us: 16_667,
+            busy: Some(BusyState {
+                episode: 1,
+                since_unix_ms: now - 2_100,
+                last_progress_unix_ms: now - 2_100,
+                activity: "test.blocked".to_string(),
+            }),
+            state: Vec::new(),
+            records: Vec::new(),
+            frame_summary: FrameSummary::default(),
+            recorder_dropped: 0,
+        });
+        assert!(runtime.incident.as_ref().unwrap().hang_reported);
         runtime.clean(false);
         let _ = fs::remove_dir_all(root);
     }

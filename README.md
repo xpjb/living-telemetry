@@ -34,6 +34,14 @@ The UI path performs clock reads, atomics, and bounded in-memory writes. A repor
 thread and same-executable watchdog own serialization, disk, HTTP, process sampling,
 and Windows dump creation.
 
+Callback wake-ups are coalesced to at most one routine snapshot per 100 ms;
+explicit reports and shutdown still wake the reporter immediately. Hang thresholds
+use elapsed UI time **observed inside a snapshot**, not time spent queued in IPC
+or writing the spool. Hang fields include `watchdog_lag_ms` separately. A silent
+reporter alone is not evidence that the UI is hung. Spool budget checks cache
+immutable envelopes' small priority/attachment index instead of repeatedly
+parsing every frame in an offline backlog.
+
 ## Collector
 
 Build and install the binary:

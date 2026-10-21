@@ -105,6 +105,7 @@ struct Client {
     clean: AtomicBool,
     report_wait: Mutex<()>,
     report_signal: Condvar,
+    report_pending: AtomicBool,
     reporter: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -168,6 +169,7 @@ pub fn init(config: Config) -> Result<(), String> {
         clean: AtomicBool::new(false),
         report_wait: Mutex::new(()),
         report_signal: Condvar::new(),
+        report_pending: AtomicBool::new(false),
         reporter: Mutex::new(None),
     });
     CLIENT
@@ -354,11 +356,7 @@ pub fn register_activity(name: &'static str) -> u64 {
 }
 
 #[doc(hidden)]
-pub fn scope_registered(
-    id: u64,
-    category: &'static str,
-    name: &'static str,
-) -> Scope {
+pub fn scope_registered(id: u64, category: &'static str, name: &'static str) -> Scope {
     let Some(client) = CLIENT.get() else {
         return Scope::inactive();
     };
@@ -387,11 +385,7 @@ pub fn scope_registered(
 }
 
 #[doc(hidden)]
-pub fn busy_registered(
-    id: u64,
-    category: &'static str,
-    name: &'static str,
-) -> BusyGuard {
+pub fn busy_registered(id: u64, category: &'static str, name: &'static str) -> BusyGuard {
     let Some(client) = CLIENT.get() else {
         return BusyGuard::inactive();
     };
@@ -463,12 +457,7 @@ impl Drop for Scope {
                 .store(client.now_us() + 1, Ordering::Release);
         }
         if current && duration_us >= client.slow_scope_us {
-            client.record_event(
-                self.category,
-                self.name,
-                Some(duration_us),
-                Vec::new(),
-            );
+            client.record_event(self.category, self.name, Some(duration_us), Vec::new());
         }
     }
 }
@@ -564,6 +553,7 @@ pub fn report(topic: &'static str, kind: &'static str, fields: Vec<Field>) -> bo
             kind: kind.to_string(),
             fields,
         });
+        client.report_pending.store(true, Ordering::Release);
     }
     client.report_signal.notify_one();
     true
@@ -869,14 +859,18 @@ impl Client {
 
     fn snapshot(&self) -> (Snapshot, Vec<ReportRequest>) {
         let (state, records, reports, frame_summary) = match self.shared.lock() {
-            Ok(mut shared) => (
-                shared.state.clone(),
-                shared.records.drain(..).collect(),
-                shared.reports.drain(..).collect(),
-                shared.frame_summary.clone(),
-            ),
+            Ok(mut shared) => {
+                self.report_pending.store(false, Ordering::Release);
+                (
+                    shared.state.clone(),
+                    shared.records.drain(..).collect(),
+                    shared.reports.drain(..).collect(),
+                    shared.frame_summary.clone(),
+                )
+            }
             Err(poisoned) => {
                 let mut shared = poisoned.into_inner();
+                self.report_pending.store(false, Ordering::Release);
                 (
                     shared.state.clone(),
                     shared.records.drain(..).collect(),
@@ -908,16 +902,19 @@ impl Client {
         } else {
             None
         };
-        (Snapshot {
-            unix_ms: self.unix_for_us(now_us),
-            uptime_ms: now_us / 1_000,
-            frame_budget_us: self.frame_budget_us.load(Ordering::Acquire),
-            busy,
-            state,
-            records,
-            frame_summary,
-            recorder_dropped: self.recorder_dropped.load(Ordering::Acquire),
-        }, reports)
+        (
+            Snapshot {
+                unix_ms: self.unix_for_us(now_us),
+                uptime_ms: now_us / 1_000,
+                frame_budget_us: self.frame_budget_us.load(Ordering::Acquire),
+                busy,
+                state,
+                records,
+                frame_summary,
+                recorder_dropped: self.recorder_dropped.load(Ordering::Acquire),
+            },
+            reports,
+        )
     }
 
     fn report(
@@ -963,6 +960,7 @@ fn reporter_loop(client: Arc<Client>, launch: WatchdogLaunch) {
         .is_none()
         .then(|| watchdog::Runtime::new(launch.clone()));
     loop {
+        let sent_at = Instant::now();
         let (snapshot, reports) = client.snapshot();
         let busy = snapshot.busy.is_some();
         let message = WatchMessage::Snapshot(snapshot.clone());
@@ -978,9 +976,9 @@ fn reporter_loop(client: Arc<Client>, launch: WatchdogLaunch) {
             fallback_synced = true;
         }
         for report in reports {
-            let delivered = writer
-                .as_mut()
-                .is_some_and(|writer| write_message(writer, &WatchMessage::Report(report.clone())).is_ok());
+            let delivered = writer.as_mut().is_some_and(|writer| {
+                write_message(writer, &WatchMessage::Report(report.clone())).is_ok()
+            });
             if !delivered {
                 writer = None;
                 let runtime = local.get_or_insert_with(|| watchdog::Runtime::new(launch.clone()));
@@ -1008,11 +1006,30 @@ fn reporter_loop(client: Arc<Client>, launch: WatchdogLaunch) {
         } else {
             Duration::from_secs(1)
         };
-        let guard = client
-            .report_wait
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _ = client.report_signal.wait_timeout(guard, delay);
+        let mut deadline = sent_at + delay;
+        let mut guard = client.report_wait.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if client.shutdown.load(Ordering::Acquire)
+                || client.report_pending.load(Ordering::Acquire)
+            {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (next, result) = client
+                .report_signal
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(|p| p.into_inner());
+            guard = next;
+            if !result.timed_out() {
+                // busy! wakes the reporter on every UI callback. Coalesce
+                // those wakes instead of serializing a snapshot per frame or
+                // mouse event. Explicit reports and shutdown bypass the wait.
+                deadline = coalesced_deadline(deadline, sent_at);
+            }
+        }
     }
     drop(writer);
     if let Some((mut child, _)) = child.take() {
@@ -1029,6 +1046,10 @@ fn reporter_loop(client: Arc<Client>, launch: WatchdogLaunch) {
             }
         }
     }
+}
+
+fn coalesced_deadline(deadline: Instant, sent_at: Instant) -> Instant {
+    deadline.min(sent_at + Duration::from_millis(100))
 }
 
 fn write_message(writer: &mut BufWriter<ChildStdin>, message: &WatchMessage) -> Result<(), String> {
@@ -1121,6 +1142,16 @@ macro_rules! busy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn callback_wakes_do_not_send_or_postpone_snapshots_per_frame() {
+        let sent = Instant::now();
+        let mut deadline = sent + Duration::from_secs(1);
+        for _ in 0..1_000 {
+            deadline = coalesced_deadline(deadline, sent);
+            assert_eq!(deadline.duration_since(sent), Duration::from_millis(100));
+        }
+    }
 
     #[test]
     fn zero_timestamp_decodes_as_missing() {

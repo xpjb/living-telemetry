@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::protocol::{Attachment, Report, SpoolEnvelope};
 use crate::transport::Endpoint;
@@ -9,6 +11,25 @@ pub(crate) struct Spool {
     root: PathBuf,
     max_bytes: u64,
     endpoint: Option<Endpoint>,
+    usage: Mutex<HashMap<PathBuf, CachedUsage>>,
+}
+
+#[derive(Clone)]
+struct CachedUsage {
+    json_bytes: u64,
+    priority: u8,
+    attachments: Vec<PathBuf>,
+}
+
+// Recovery needs only this index, not thousands of allocated frame records.
+#[derive(serde::Deserialize)]
+struct EnvelopeIndex {
+    report: ReportIndex,
+    attachment_paths: Vec<PathBuf>,
+}
+#[derive(serde::Deserialize)]
+struct ReportIndex {
+    kind: String,
 }
 
 impl Spool {
@@ -19,10 +40,15 @@ impl Spool {
             root,
             max_bytes,
             endpoint,
+            usage: Mutex::new(HashMap::new()),
         })
     }
 
-    pub fn enqueue(&self, mut report: Report, attachments: Vec<PathBuf>) -> Result<PathBuf, String> {
+    pub fn enqueue(
+        &self,
+        mut report: Report,
+        attachments: Vec<PathBuf>,
+    ) -> Result<PathBuf, String> {
         report.attachments = attachments
             .iter()
             .filter_map(|path| {
@@ -45,6 +71,14 @@ impl Spool {
         );
         let path = self.root.join(filename);
         atomic_json(&path, &envelope)?;
+        self.usage.lock().unwrap_or_else(|p| p.into_inner()).insert(
+            path.clone(),
+            CachedUsage {
+                json_bytes: fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                priority,
+                attachments: envelope.attachment_paths,
+            },
+        );
         self.enforce_bound();
         Ok(path)
     }
@@ -105,24 +139,41 @@ impl Spool {
         let Ok(entries) = spool_entries(&self.root) else {
             return;
         };
+        let mut usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
+        // Spool envelopes are immutable after atomic publication. Cache only
+        // their small accounting index; never re-read/deserialize the whole
+        // offline backlog on every enqueue. The uploader may delete entries.
+        usage.retain(|path, _| entries.binary_search(path).is_ok());
         let mut sized = entries
             .into_iter()
             .filter_map(|path| {
-                let metadata = fs::metadata(&path).ok()?;
-                let envelope = fs::read(&path)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<SpoolEnvelope>(&bytes).ok());
-                let attachments = envelope
-                    .as_ref()
-                    .map(|envelope| {
-                        envelope
-                            .attachment_paths
-                            .iter()
-                            .filter_map(|path| fs::metadata(path).ok().map(|meta| meta.len()))
-                            .sum::<u64>()
-                    })
-                    .unwrap_or(0);
-                Some((path, metadata.len().saturating_add(attachments), envelope))
+                let json_bytes = fs::metadata(&path).ok()?.len();
+                if usage
+                    .get(&path)
+                    .is_none_or(|entry| entry.json_bytes != json_bytes)
+                {
+                    let index = fs::read(&path)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<EnvelopeIndex>(&bytes).ok());
+                    usage.insert(
+                        path.clone(),
+                        CachedUsage {
+                            json_bytes,
+                            priority: index
+                                .as_ref()
+                                .map_or(5, |index| report_priority(&index.report.kind)),
+                            attachments: index
+                                .map_or_else(Vec::new, |index| index.attachment_paths),
+                        },
+                    );
+                }
+                let entry = usage.get(&path).unwrap().clone();
+                let attachments = entry
+                    .attachments
+                    .iter()
+                    .filter_map(|path| fs::metadata(path).ok().map(|m| m.len()))
+                    .sum::<u64>();
+                Some((path, json_bytes.saturating_add(attachments), entry))
             })
             .collect::<Vec<_>>();
         let mut total = sized.iter().map(|(_, bytes, _)| *bytes).sum::<u64>();
@@ -130,21 +181,21 @@ impl Spool {
             return;
         }
         sized.sort_by(|left, right| {
-            deletion_rank(&left.2)
-                .cmp(&deletion_rank(&right.2))
-                .reverse()
+            right
+                .2
+                .priority
+                .cmp(&left.2.priority)
                 .then_with(|| left.0.cmp(&right.0))
         });
-        for (path, bytes, envelope) in sized {
+        for (path, bytes, entry) in sized {
             if total <= self.max_bytes {
                 break;
             }
-            if let Some(envelope) = envelope {
-                for attachment in envelope.attachment_paths {
-                    let _ = fs::remove_file(attachment);
-                }
+            for attachment in entry.attachments {
+                let _ = fs::remove_file(attachment);
             }
-            if fs::remove_file(path).is_ok() {
+            if fs::remove_file(&path).is_ok() {
+                usage.remove(&path);
                 total = total.saturating_sub(bytes);
             }
         }
@@ -162,13 +213,6 @@ fn report_priority(kind: &str) -> u8 {
     }
 }
 
-fn deletion_rank(envelope: &Option<SpoolEnvelope>) -> u8 {
-    envelope
-        .as_ref()
-        .map(|envelope| report_priority(&envelope.report.kind))
-        .unwrap_or(5)
-}
-
 fn attachment_media_type(path: &Path) -> &'static str {
     match path.extension().and_then(|value| value.to_str()) {
         Some("dmp") => "application/x-minidump",
@@ -181,7 +225,10 @@ fn spool_entries(root: &Path) -> Result<Vec<PathBuf>, String> {
         .map_err(|err| err.to_string())?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
         .collect::<Vec<_>>();
     entries.sort();
     Ok(entries)
@@ -264,6 +311,31 @@ mod tests {
         let envelope: SpoolEnvelope =
             serde_json::from_slice(&fs::read(&entries[0]).unwrap()).unwrap();
         assert_eq!(envelope.report.kind, "process_exit");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cached_budget_includes_attachments_and_prunes_uploaded_entries() {
+        let root = temp_dir("living-telemetry-cached-budget");
+        let spool = Spool::new(root.clone(), u64::MAX, None).unwrap();
+        let dump = root.join("hang.dmp");
+        fs::write(&dump, vec![0u8; 4096]).unwrap();
+        let hang = spool.enqueue(report("hang"), vec![dump.clone()]).unwrap();
+        let summary = spool
+            .enqueue(report("runtime_summary"), Vec::new())
+            .unwrap();
+        assert_eq!(spool.usage.lock().unwrap().len(), 2);
+        // A new process recovers only the lightweight kind/attachment index.
+        let budget = fs::metadata(&hang).unwrap().len() + 4096;
+        let bounded = Spool::new(root.clone(), budget, None).unwrap();
+        bounded.enforce_bound();
+        assert!(hang.exists() && dump.exists());
+        assert!(!summary.exists());
+        assert_eq!(bounded.usage.lock().unwrap().len(), 1);
+        fs::remove_file(&hang).unwrap(); // Model a successful upload.
+        fs::remove_file(&dump).unwrap();
+        bounded.enforce_bound();
+        assert!(bounded.usage.lock().unwrap().is_empty());
         let _ = fs::remove_dir_all(root);
     }
 }
