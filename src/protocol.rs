@@ -313,7 +313,14 @@ pub(crate) struct WatchdogLaunch {
     pub spool_max_bytes: u64,
     pub stall_ms: u64,
     pub hang_ms: u64,
+    #[serde(default = "default_hang_dump_limit")]
+    pub hang_dump_limit: u32,
+    #[serde(default = "default_hang_dump_cooldown_ms")]
+    pub hang_dump_cooldown_ms: u64,
 }
+
+pub(crate) fn default_hang_dump_limit() -> u32 { 2 }
+pub(crate) fn default_hang_dump_cooldown_ms() -> u64 { 10 * 60 * 1_000 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct RunCheckpoint {

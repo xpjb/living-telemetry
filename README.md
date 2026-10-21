@@ -42,6 +42,34 @@ reporter alone is not evidence that the UI is hung. Spool budget checks cache
 immutable envelopes' small priority/attachment index instead of repeatedly
 parsing every frame in an offline backlog.
 
+## Session-bounded diagnostics
+
+`run_id` is the session key; each record has a sequence number. Automatic reports
+use `records_scope=session_delta` and a bounded 8,192-ID sent cache to avoid
+repeating recent records across performance/hang/follow-up reports. The initial
+stall retains a self-contained 128-record incident window. Every exact slow target
+still enters the session stream; optional surrounding context is capped at 128
+records. Reconstruct automatic history by joining the same `run_id` and record
+sequence. Small identity/current-state headers remain on each report so a report
+is still identifiable without the rest of the session.
+
+Explicit reproduction reports and panic/native-crash reports keep the full
+bounded flight-recorder context. Emergency unclean-exit checkpoints retain the
+most recent 256 records and write at most every 15 seconds while busy (30 seconds
+while idle), not a complete 4,096-record rewrite every two seconds.
+
+Automatic **hang** captures have a default budget of **two attempts per run**, at
+least **ten minutes apart**, including failed attempts. `Config::hang_dump_limit`
+can set another budget (zero disables automatic hang dumps), and
+`hang_dump_cooldown` changes the interval. This budget does not disable the native
+fatal-crash handler or panic reporting. Further hangs still send lightweight
+incident reports; continuation/recovery does not request another dump. The report
+fields `dump_status`, `dump_capture_us`, `automatic_dump_attempts`, and
+`automatic_dump_suppressed` expose what happened and its measured capture cost.
+Windows captures already use small normal minidumps with thread information, not
+full process-memory dumps; reducing capture frequency and redundant JSON avoids
+more work than stripping useful stacks or adding always-on compression.
+
 ## Collector
 
 Build and install the binary:

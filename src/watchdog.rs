@@ -1,11 +1,11 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::platform;
 use crate::protocol::{
@@ -17,6 +17,32 @@ use crate::spool::{Spool, atomic_json};
 const WATCHDOG_ARG: &str = "--living-telemetry-watchdog";
 const WATCHDOG_CONFIG: &str = "LIVING_TELEMETRY_WATCHDOG_CONFIG";
 const SNAPSHOT_FRESH_MS: u64 = 3_000;
+const INCIDENT_CONTEXT_RECORDS: usize = 128;
+const CHECKPOINT_RECORDS: usize = 256;
+const SENT_RECORD_CACHE: usize = 8_192;
+const ACTIVE_CHECKPOINT_MS: u64 = 15_000;
+
+struct DumpBudget {
+    limit: u32,
+    cooldown_ms: u64,
+    attempts: u32,
+    suppressed: u64,
+    last_attempt_ms: Option<u64>,
+}
+impl DumpBudget {
+    fn reserve(&mut self, now: u64) -> &'static str {
+        let reason = if self.attempts >= self.limit { "session_limit" }
+            else if self.last_attempt_ms.is_some_and(|last| now.saturating_sub(last) < self.cooldown_ms) { "cooldown" }
+            else {
+                // Reserve BEFORE capture: failed dumps must not become a retry storm.
+                self.attempts += 1;
+                self.last_attempt_ms = Some(now);
+                return "capture";
+            };
+        self.suppressed += 1;
+        reason
+    }
+}
 
 pub(crate) fn spawn(launch: &WatchdogLaunch) -> Result<(Child, Option<ChildStdin>), String> {
     let executable = std::env::current_exe().map_err(|err| err.to_string())?;
@@ -127,6 +153,9 @@ pub(crate) struct Runtime {
     uploader: Option<thread::JoinHandle<()>>,
     checkpoint_path: PathBuf,
     cleaned: bool,
+    dump_budget: DumpBudget,
+    sent_records: HashSet<u64>,
+    sent_order: VecDeque<u64>,
 }
 
 impl Runtime {
@@ -174,6 +203,8 @@ impl Runtime {
             .data_dir
             .join("runs")
             .join(format!("{}.json", launch.run_id));
+        let dump_budget = DumpBudget { limit: launch.hang_dump_limit,
+            cooldown_ms: launch.hang_dump_cooldown_ms, attempts: 0, suppressed: 0, last_attempt_ms: None };
         Self {
             snapshot: Snapshot {
                 unix_ms: launch.start_unix_ms,
@@ -196,6 +227,9 @@ impl Runtime {
             uploader,
             checkpoint_path,
             cleaned: false,
+            dump_budget,
+            sent_records: HashSet::new(),
+            sent_order: VecDeque::new(),
             spool,
             launch,
         }
@@ -258,7 +292,7 @@ impl Runtime {
             self.last_summary_frames = self.snapshot.frame_summary.frames;
         }
         let checkpoint_interval_ms = if self.snapshot.busy.is_some() {
-            2_000
+            ACTIVE_CHECKPOINT_MS
         } else {
             30_000
         };
@@ -392,7 +426,7 @@ impl Runtime {
                 "stall",
                 common(),
                 Vec::new(),
-                self.records.iter().cloned().collect(),
+                self.incident_records(),
             );
         }
         if emit_hang {
@@ -401,17 +435,22 @@ impl Runtime {
                 .data_dir
                 .join("attachments")
                 .join(format!("{}-hang-{}.dmp", self.launch.run_id, busy.episode));
-            let attachments = if platform::write_minidump(self.launch.parent_pid, &dump).is_ok() {
-                vec![dump]
-            } else {
-                Vec::new()
-            };
+            let decision = self.dump_budget.reserve(now);
+            let mut fields = common();
+            let mut attachments = Vec::new();
+            let status = if decision == "capture" {
+                let started = Instant::now();
+                let result = platform::write_minidump(self.launch.parent_pid, &dump);
+                fields.push(Field::new("dump_capture_us", started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64));
+                if result.is_ok() { attachments.push(dump); "captured" } else { "failed" }
+            } else { decision };
+            fields.push(Field::new("dump_status", status));
             self.emit(
                 "hang",
                 "hang",
-                common(),
+                fields,
                 attachments,
-                self.records.iter().cloned().collect(),
+                self.incident_records(),
             );
         }
         if emit_continuation {
@@ -420,7 +459,7 @@ impl Runtime {
                 "hang_continues",
                 common(),
                 Vec::new(),
-                self.records.iter().cloned().collect(),
+                self.incident_records(),
             );
         }
     }
@@ -441,7 +480,7 @@ impl Runtime {
                 Field::new("reached_hang", incident.hang_reported),
             ],
             Vec::new(),
-            self.records.iter().cloned().collect(),
+            self.incident_records(),
         );
     }
 
@@ -467,17 +506,13 @@ impl Runtime {
             .max()
             .unwrap_or(start_us)
             .saturating_add(50_000);
-        let mut records = self
-            .records
-            .iter()
+        let mut seen: HashSet<_> = targets.iter().map(Record::seq).collect();
+        let context = self.records.iter().rev()
             .filter(|record| (start_us..=end_us).contains(&record.uptime_us()))
-            .cloned()
-            .collect::<Vec<_>>();
-        for target in targets {
-            if !records.iter().any(|record| record.seq() == target.seq()) {
-                records.push(target);
-            }
-        }
+            .filter(|record| seen.insert(record.seq()))
+            .take(INCIDENT_CONTEXT_RECORDS).cloned().collect::<Vec<_>>();
+        let mut records = targets;
+        records.extend(context);
         records.sort_by_key(Record::seq);
         self.emit(
             "performance",
@@ -496,10 +531,22 @@ impl Runtime {
         &mut self,
         topic: &str,
         kind: &str,
-        fields: Vec<Field>,
+        mut fields: Vec<Field>,
         attachments: Vec<PathBuf>,
         records: Vec<Record>,
     ) {
+        let automatic = matches!(topic, "performance" | "hang");
+        let delta = automatic && kind != "stall";
+        let records: Vec<_> = records.into_iter()
+            .filter(|record| !delta || !self.sent_records.contains(&record.seq())).collect();
+        let sequences = automatic.then(|| records.iter().map(Record::seq).collect::<Vec<_>>());
+        if automatic {
+            fields.push(Field::new("records_scope", if delta { "session_delta" } else { "incident_context" }));
+            fields.extend([
+                Field::new("automatic_dump_attempts", self.dump_budget.attempts),
+                Field::new("automatic_dump_suppressed", self.dump_budget.suppressed),
+            ]);
+        }
         let process = platform::process_sample(self.launch.parent_pid);
         let report = Report {
             schema: SCHEMA_VERSION,
@@ -523,19 +570,29 @@ impl Runtime {
             fields,
             attachments: Vec::new(),
         };
-        if let Some(spool) = &self.spool {
-            let _ = spool.enqueue(report, attachments);
-            if let Some(sender) = &self.flush_sender {
-                let _ = sender.try_send(());
+        let queued = self.spool.as_ref().is_some_and(|spool| spool.enqueue(report, attachments).is_ok());
+        if queued {
+            if let Some(sequences) = sequences {
+                for seq in sequences {
+                    if self.sent_records.insert(seq) { self.sent_order.push_back(seq); }
+                }
+                while self.sent_order.len() > SENT_RECORD_CACHE {
+                    if let Some(seq) = self.sent_order.pop_front() { self.sent_records.remove(&seq); }
+                }
             }
+            if let Some(sender) = &self.flush_sender { let _ = sender.try_send(()); }
         }
+    }
+
+    fn incident_records(&self) -> Vec<Record> {
+        self.records.iter().rev().take(INCIDENT_CONTEXT_RECORDS).rev().cloned().collect()
     }
 
     fn write_checkpoint(&self) {
         let checkpoint = RunCheckpoint {
             launch: self.launch.clone(),
             snapshot: self.snapshot.clone(),
-            records: self.records.iter().cloned().collect(),
+            records: self.records.iter().rev().take(CHECKPOINT_RECORDS).rev().cloned().collect(),
         };
         let _ = atomic_json(&self.checkpoint_path, &checkpoint);
     }
@@ -630,7 +687,117 @@ mod tests {
             spool_max_bytes: 4 * 1024 * 1024,
             stall_ms: 250,
             hang_ms: 2_000,
+            hang_dump_limit: crate::protocol::default_hang_dump_limit(),
+            hang_dump_cooldown_ms: crate::protocol::default_hang_dump_cooldown_ms(),
         }
+    }
+
+    fn test_record(seq: u64) -> Record {
+        Record::Event(crate::protocol::EventRecord {
+            seq, uptime_us: seq * 1_000, unix_ms: unix_ms(), thread: "ui".into(),
+            category: "test".into(), name: "work".into(), duration_us: Some(20_000), fields: Vec::new(),
+        })
+    }
+
+    fn reports(root: &std::path::Path) -> Vec<SpoolEnvelope> {
+        fs::read_dir(root.join("spool")).unwrap().filter_map(Result::ok)
+            .filter_map(|entry| fs::read(entry.path()).ok())
+            .filter_map(|bytes| serde_json::from_slice(&bytes).ok()).collect()
+    }
+
+    #[test]
+    fn automatic_dump_budget_has_cooldown_and_session_limit_even_after_failure() {
+        let mut budget = DumpBudget { limit: 2, cooldown_ms: 600_000,
+            attempts: 0, suppressed: 0, last_attempt_ms: None };
+        assert_eq!(budget.reserve(1_000), "capture");
+        // A reserved attempt is consumed even if the OS capture fails.
+        assert_eq!(budget.reserve(1_001), "cooldown");
+        assert_eq!(budget.reserve(600_999), "cooldown");
+        assert_eq!(budget.reserve(601_000), "capture");
+        assert_eq!(budget.reserve(1_500_000), "session_limit");
+        assert_eq!((budget.attempts, budget.suppressed), (2, 3));
+        budget.limit = 0;
+        assert_eq!(budget.reserve(9_000_000), "session_limit");
+    }
+
+    #[test]
+    fn automatic_reports_send_record_deltas_but_repro_and_crash_keep_full_context() {
+        let root = std::env::temp_dir().join(unique_id("living-telemetry-deltas"));
+        let mut runtime = Runtime::new(launch(root.clone()));
+        runtime.records = (1..=1_000).map(test_record).collect();
+        runtime.emit("hang", "stall", Vec::new(), Vec::new(), runtime.incident_records());
+        runtime.performance = runtime.records.iter().cloned().collect();
+        runtime.report_performance();
+        runtime.emit("hang", "hang_continues", Vec::new(), Vec::new(), runtime.incident_records());
+        runtime.report(ReportRequest { topic: "feedback".into(), kind: "repro".into(), fields: Vec::new() });
+        runtime.emit("crash", "panic", Vec::new(), Vec::new(), runtime.records.iter().cloned().collect());
+        let all = reports(&root);
+        let find = |kind: &str| &all.iter().find(|e| e.report.kind == kind).unwrap().report;
+        assert_eq!(find("stall").records.len(), INCIDENT_CONTEXT_RECORDS);
+        assert_eq!(find("slow_intervals").records.len(), 1_000 - INCIDENT_CONTEXT_RECORDS);
+        assert!(find("hang_continues").records.is_empty());
+        assert_eq!(find("repro").records.len(), 1_000);
+        assert_eq!(find("panic").records.len(), 1_000);
+        let sent = find("stall").records.iter().chain(&find("slow_intervals").records)
+            .map(Record::seq).collect::<HashSet<_>>();
+        assert_eq!(sent.len(), 1_000, "no exact slow target may disappear during deduplication");
+        let bytes = |kind| serde_json::to_vec(find(kind)).unwrap().len();
+        assert!(bytes("hang_continues") < bytes("stall") / 4);
+        println!("bounded incident={} bytes; continuation={} bytes; explicit repro={} bytes",
+            bytes("stall"), bytes("hang_continues"), bytes("repro"));
+        runtime.clean(false);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkpoint_is_recent_bounded_context_and_not_written_every_two_seconds() {
+        let root = std::env::temp_dir().join(unique_id("living-telemetry-light-checkpoint"));
+        let mut runtime = Runtime::new(launch(root.clone()));
+        runtime.records = (1..=1_000).map(test_record).collect();
+        let now = unix_ms();
+        runtime.snapshot.unix_ms = now;
+        runtime.snapshot.busy = Some(BusyState { episode: 1, since_unix_ms: now,
+            last_progress_unix_ms: now, activity: "test".into() });
+        let prior = now - 2_500;
+        runtime.last_checkpoint_ms = prior;
+        runtime.tick();
+        assert_eq!(runtime.last_checkpoint_ms, prior);
+        runtime.last_checkpoint_ms = now - ACTIVE_CHECKPOINT_MS - 1;
+        runtime.tick();
+        let checkpoint: RunCheckpoint = serde_json::from_slice(&fs::read(&runtime.checkpoint_path).unwrap()).unwrap();
+        assert_eq!(checkpoint.records.len(), CHECKPOINT_RECORDS);
+        assert_eq!(checkpoint.records.first().unwrap().seq(), 1_001 - CHECKPOINT_RECORDS as u64);
+        assert_eq!(checkpoint.records.last().unwrap().seq(), 1_000);
+        runtime.clean(false);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn old_checkpoint_launch_metadata_gets_safe_dump_defaults() {
+        let root = std::env::temp_dir().join(unique_id("living-telemetry-old-launch"));
+        let mut value = serde_json::to_value(launch(root)).unwrap();
+        value.as_object_mut().unwrap().remove("hang_dump_limit");
+        value.as_object_mut().unwrap().remove("hang_dump_cooldown_ms");
+        let recovered: WatchdogLaunch = serde_json::from_value(value).unwrap();
+        assert_eq!(recovered.hang_dump_limit, 2);
+        assert_eq!(recovered.hang_dump_cooldown_ms, 600_000);
+    }
+
+    #[test]
+    fn session_record_dedup_cache_is_bounded_and_failed_enqueue_does_not_mark_sent() {
+        let root = std::env::temp_dir().join(unique_id("living-telemetry-sent-bound"));
+        let mut runtime = Runtime::new(launch(root.clone()));
+        runtime.emit("performance", "slow_intervals", Vec::new(), Vec::new(),
+            (1..=SENT_RECORD_CACHE as u64 + 50).map(test_record).collect());
+        assert_eq!(runtime.sent_records.len(), SENT_RECORD_CACHE);
+        assert_eq!(runtime.sent_order.len(), SENT_RECORD_CACHE);
+        assert!(!runtime.sent_records.contains(&1));
+        assert!(runtime.sent_records.contains(&(SENT_RECORD_CACHE as u64 + 50)));
+        runtime.spool = None;
+        runtime.emit("performance", "slow_intervals", Vec::new(), Vec::new(), vec![test_record(1_000_000)]);
+        assert!(!runtime.sent_records.contains(&1_000_000));
+        runtime.clean(false);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

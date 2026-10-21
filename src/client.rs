@@ -32,6 +32,9 @@ pub struct Config {
     pub slow_scope: Duration,
     pub stall_after: Duration,
     pub hang_after: Duration,
+    /// Automatic hang dumps only; fatal-crash capture remains independent.
+    pub hang_dump_limit: u32,
+    pub hang_dump_cooldown: Duration,
 }
 
 impl Config {
@@ -51,6 +54,8 @@ impl Config {
             slow_scope: Duration::from_millis(2),
             stall_after: Duration::from_millis(250),
             hang_after: Duration::from_secs(2),
+            hang_dump_limit: crate::protocol::default_hang_dump_limit(),
+            hang_dump_cooldown: Duration::from_millis(crate::protocol::default_hang_dump_cooldown_ms()),
         }
     }
 }
@@ -191,6 +196,8 @@ pub fn init(config: Config) -> Result<(), String> {
         spool_max_bytes: client.metadata.spool_max_bytes,
         stall_ms: config.stall_after.as_millis().min(u128::from(u64::MAX)) as u64,
         hang_ms: config.hang_after.as_millis().min(u128::from(u64::MAX)) as u64,
+        hang_dump_limit: config.hang_dump_limit,
+        hang_dump_cooldown_ms: config.hang_dump_cooldown.as_millis().min(u128::from(u64::MAX)) as u64,
     };
     let reporter_client = client.clone();
     let reporter = thread::Builder::new()
